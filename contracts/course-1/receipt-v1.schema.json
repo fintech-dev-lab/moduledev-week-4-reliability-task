@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:course:course-1:receipt-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "externalRequestId",
+    "messageId",
+    "occurredAt",
+    "outcome",
+    "providerPaymentId",
+    "version"
+  ],
+  "properties": {
+    "externalRequestId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "messageId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 64,
+      "pattern": "Z$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "outcome": {"enum": ["COMPLETED", "REJECTED"]},
+    "providerPaymentId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "version": {"const": 1}
+  }
+}

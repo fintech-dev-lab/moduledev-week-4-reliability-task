@@ -1,0 +1,20 @@
+{
+  "manifestVersion": "week-4.1",
+  "contractVersion": "course-1",
+  "week": 4,
+  "maximum": 30,
+  "cumulativeMaximum": 100,
+  "criteria": [
+    {"id": "PG-04", "weight": 5, "invariant": "Request, job, signal and manual repeats do not create a second subject effect", "evidence": ["idempotency.concurrent-request-submit", "idempotency.job-reclaim-single-effect", "idempotency.signal-callback-repeat", "idempotency.manual-repeat-after-restart"]},
+    {"id": "REL-01", "weight": 3, "invariant": "Concurrent Outbox dispatchers apply timeout, retry, backoff, jitter and dead-letter policy", "evidence": ["outbox.concurrent-claim", "outbox.retry-schedule", "outbox.terminal-dead"]},
+    {"id": "REL-02", "weight": 3, "invariant": "Jobs and deliveries recover after lease expiry and restart", "evidence": ["workflow.expired-job-reclaim", "workflow.stale-finish-rejected", "outbox.expired-delivery-reclaim"]},
+    {"id": "REL-03", "weight": 3, "invariant": "Provider outage and lost response neither lose a request nor duplicate a payment", "evidence": ["provider.outage-recovery", "provider.lost-response-single-payment", "provider.late-receipt-after-dead"]},
+    {"id": "REL-04", "weight": 3, "invariant": "API, workers, dispatchers and PostgreSQL clients survive a full restart", "evidence": ["recovery.mixed-state-full-restart", "recovery.callback-repeat", "recovery.manual-repeat"]},
+    {"id": "REL-05", "weight": 3, "invariant": "Deterministic failpoints prove commit-boundary invariants", "evidence": ["failpoint.job-claim", "failpoint.action-before-finish", "failpoint.outbox-claim", "failpoint.provider-response", "failpoint.inbox-saved", "failpoint.manual-decision"]},
+    {"id": "OBS-01", "weight": 2, "invariant": "The complete stack builds and starts from a clean environment with one command", "evidence": ["startup.cold-build", "startup.no-manual-setup"]},
+    {"id": "OBS-02", "weight": 2, "invariant": "Published unit, integration and end-to-end tests are reproducible", "evidence": ["tests.public-check", "tests.candidate-suite"]},
+    {"id": "OBS-03", "weight": 2, "invariant": "Liveness, readiness and required metrics reflect actual state", "evidence": ["health.live-ready-semantics", "metrics.required-series", "metrics.queue-state", "metrics.bounded-cardinality"]},
+    {"id": "OBS-04", "weight": 2, "invariant": "Trace and structured logs connect the complete operation path", "evidence": ["trace.known-identifiers", "trace.persisted-evidence", "logs.structured-correlation"]},
+    {"id": "OBS-05", "weight": 2, "invariant": "Code, configuration, image layers and logs contain no secrets or excessive data", "evidence": ["security.repository-scan", "security.image-layer-scan", "security.log-report-redaction"]}
+  ]
+}

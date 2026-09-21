@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+week-4-public-report.json
+.env

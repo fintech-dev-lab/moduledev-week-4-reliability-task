@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moduledev.example/contracts/course-1/diagnostics-trace.payload.schema.json",
+  "title": "diagnostics.trace version 1 payload",
+  "type": "object",
+  "required": ["identifier"],
+  "properties": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[^\\r\\n]+$"
+    }
+  },
+  "additionalProperties": false
+}
