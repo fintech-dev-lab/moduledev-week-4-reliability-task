@@ -1,6 +1,18 @@
 # Зона 4. Аварийный режим
 
+## Срок и сдача
+
+Работа выполняется с 24 по 30 сентября 2026 года. Дедлайн — **30 сентября, 23:59 МСК**.
+
+До дедлайна отправьте куратору URL прежнего репозитория решения, ветку и полный SHA commit; заранее предоставьте доступ. Секреты, build output, логи и сгенерированные отчёты в сдачу не включаются.
+
 ## Результат
+
+Учебный зачёт подтверждает обязательные условия результата недели 3 и сохранение
+результата при конкурентных исполнителях, stale completion и аварийных границах commit.
+Полное техническое соответствие и баллы считаются отдельно. Частные форматы остаются
+замечаниями; непроверенное критическое свойство даёт «Недостаточно данных».
+Полный [регламент зачёта](../docs/review-calibration-weeks-3-4.md).
 
 Продолжите тот же репозиторий, который сдавали на неделях 1–3. Не переносите решение в новый starter и не меняйте архитектурные границы предыдущих недель.
 
@@ -9,7 +21,7 @@ command -> PostgreSQL state + Outbox
 Outbox -> two Python dispatchers -> provider v0.2.0
 callback -> adapter -> generic C# API -> Inbox
 Inbox -> two Python reconcilers -> workflow signal -> worker
-persisted facts -> metrics + diagnostics.trace
+persisted facts -> metrics + diagnostics.trace + diagnostics.stalled
 ```
 
 Результат недели: после контролируемого сбоя и полного restart нет потерянного сообщения, второго предметного эффекта или ложного успеха. Recovery выполняют обычные worker/dispatcher/reconciler loops по состоянию PostgreSQL, а не ручной SQL.
@@ -44,6 +56,8 @@ persisted facts -> metrics + diagnostics.trace
 - поздняя валидная receipt переводит delivery в `CONFIRMED` и продолжает process.
 
 `DEAD` является техническим исходом доставки. Он не переводит operation в `REJECTED` и ожидающий receipt process в `FAILED`.
+
+Диагностика исчерпания хранится в Outbox: `state = DEAD`, непустые `dead_at` и `last_error_code`, сохранённый `attempt_count`. В trace это `state`, `deadAt`, `lastErrorCode`, `attemptCount`. Отдельный флаг ошибки у process не требуется.
 
 Test profile: четыре attempts, включая первую; timeout 500 ms; base delays 200/400/800 ms; jitter 0–100 ms; delivery/job lease 2 s; dispatcher/worker poll не более 100 ms.
 
@@ -96,6 +110,14 @@ workflow_failures_total
 
 Trace связывает dispatch, operation/events, pinned process, steps, jobs/attempts, Outbox/Inbox и receipt/decision. Поддерживаемые identifiers и точная response schema опубликованы в [контракте наблюдаемости](../docs/observability-contracts.md).
 
+## `diagnostics.stalled`
+
+Реализуйте action `diagnostics.stalled`, возвращающий операции с затянувшимся ожиданием квитанции после исчерпания автоматических попыток доставки.
+
+Version 1 публикуется как `POST /api/diagnostics/stalled`, требует `diagnostics:read`, принимает `{}` и не требует idempotency key. Ответ: HTTP 200, outcome `FOUND`, result `{"items":[...]}`. Каждый элемент содержит `operationId`, `processId`, `externalRequestId`; операции не повторяются и упорядочены по `operationId`. Пустая выборка — `{"items":[]}`. Action читает PostgreSQL через тот же generic runtime и не меняет предметное состояние.
+
+Точные схемы, ошибки и правила формата — в [контракте наблюдаемости](../docs/observability-contracts.md).
+
 ## Failpoints
 
 При `COURSE_TEST_PROFILE=1` компонент принимает одну точку из `COURSE_FAILPOINT`, пишет одну JSON-строку `{"event":"failpoint.reached","name":"<name>","instanceId":"<id>"}` и блокируется до остановки:
@@ -107,7 +129,13 @@ Trace связывает dispatch, operation/events, pinned process, steps, jobs
 - `after_inbox_saved`;
 - `after_manual_decision`.
 
-Production profile игнорирует failpoints и не предоставляет endpoint для их активации. Точные границы перечислены в [полном контракте](../docs/05-week-4.md).
+Production profile игнорирует failpoints и не предоставляет endpoint для их активации. Сервисы, границы commit и порядок остановки конкурирующих исполнителей перечислены в [таблице failpoints](../docs/07-autocheck-outline.md#детерминированные-failpoints).
+
+## README и runbook
+
+README содержит требования к окружению, входную конфигурацию, команды первого запуска и полной проверки, признаки readiness и безопасную диагностику типовых отказов.
+
+В runbook приведите команды вызова `diagnostics.trace` и `diagnostics.stalled` и чтения их результатов.
 
 ## Acceptance
 
@@ -121,6 +149,7 @@ Production profile игнорирует failpoints и не предоставл�
 - PostgreSQL state переживает пересоздание Compose project благодаря declared named volume.
 - Live/ready имеют разную семантику, metrics совпадают с очередями.
 - Trace по известному identifier содержит полное сохранённое evidence.
+- `diagnostics.stalled` возвращает выборку операций в опубликованном формате без изменения предметных данных.
 - Secrets/full payload отсутствуют в repo, image layers, logs, trace и report.
 
 Действующая редакция задания — `week-4.1`. Полный контракт, configuration seam и public checker опубликованы в [docs](../docs/README.md).

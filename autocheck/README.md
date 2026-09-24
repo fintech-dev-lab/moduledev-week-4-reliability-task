@@ -31,9 +31,13 @@ Checker не вызывает `course.sh` на host и не использует
 | `outbox` | Provider outage, persisted retry, two-dispatcher resume, one provider payment |
 | `receipt` | Missing/invalid signature, exact legacy mapping, duplicate/conflict |
 | `review` | Limit-rule и manual branches |
-| `observability` | Health, required OpenMetrics series, bounded labels и trace |
+| `observability` | Health, required OpenMetrics series, bounded labels, trace и контракт `diagnostics.stalled` |
 | `recovery` | Compose down/up без удаления named PostgreSQL volume, persisted state |
 | `security` | Заявленные DB principals, отсутствие наблюдаемых runtime mismatches, узкая роль `autocheck_reader`, secret/full-message redaction |
+
+В outage-сценарии checker сначала проверяет readiness при выключенном provider, затем создаёт запрос при остановленных dispatcher и проверяет pending-метрику. После наблюдения retry он приостанавливает dispatcher через Docker pause, восстанавливает provider, ждёт его доступности и возобновляет доставку. Запуск одного service использует `--no-deps`, чтобы Compose не включил provider раньше времени. Если Docker-host не успел приостановить доставку до последней попытки, результат — ошибка окружения (exit 2), а не дефект решения; этот запуск не подтверждает recovery до исчерпания retries.
+
+`diagnostics.stalled` вызывается после завершения тестовых операций: проверяются регистрация, JSON Schema, порядок и уникальность строк, ответы 401/403/422 и сохранность предметных данных этих операций. Access logs и action audit могут пополняться.
 
 ## Hidden extensions
 

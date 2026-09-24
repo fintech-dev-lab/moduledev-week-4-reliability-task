@@ -904,6 +904,40 @@ class PollingTests(unittest.TestCase):
 
 
 class OpenMetricsTests(unittest.TestCase):
+    def test_standard_counter_family_passes_endpoint_checks(self) -> None:
+        document = (
+            "# TYPE workflow_jobs_ready gauge\nworkflow_jobs_ready 0\n"
+            "# TYPE workflow_job_oldest_age_seconds gauge\nworkflow_job_oldest_age_seconds 0\n"
+            "# TYPE workflow_processes_waiting gauge\nworkflow_processes_waiting 0\n"
+            "# TYPE outbox_pending gauge\noutbox_pending 0\n"
+            "# TYPE outbox_oldest_age_seconds gauge\noutbox_oldest_age_seconds 0\n"
+            "# TYPE workflow_failures counter\nworkflow_failures_total 0\n# EOF\n"
+        )
+        checker = object.__new__(public_check.PublicChecker)
+        checker.checks = []
+        checker.sensitive = ()
+
+        def response(service, path):
+            if path == "/metrics":
+                return public_check.HttpResult(200, document.encode(), {
+                    "Content-Type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+                })
+            status = "live" if path.endswith("/live") else "ready"
+            return public_check.HttpResult(200, json.dumps({"status": status}).encode(), {
+                "Content-Type": "application/json",
+            })
+
+        with mock.patch.object(checker, "_service_http", side_effect=response):
+            checker._check_observability_endpoints()
+        self.assertTrue(all(check["status"] == "passed" for check in checker.checks))
+
+    def test_eof_without_final_newline_is_valid_but_crlf_is_not(self) -> None:
+        samples, _, _ = public_check.parse_openmetrics("outbox_pending 0\n# EOF")
+        self.assertEqual(samples, {"outbox_pending": [0.0]})
+        for document in ("outbox_pending 0\r\n# EOF\n", "outbox_pending 0\n# EOF extra\n"):
+            with self.subTest(document=document), self.assertRaises(ValueError):
+                public_check.parse_openmetrics(document)
+
     def test_required_series_and_labels_are_parsed(self) -> None:
         document = (
             "# TYPE outbox_pending gauge\n"
@@ -955,6 +989,62 @@ class OpenMetricsTests(unittest.TestCase):
         )
 
 
+class OutageRecoveryTests(unittest.TestCase):
+    def row(self, state="RETRY_WAIT", attempts=1, code="transport.error.retryable"):
+        return [{"state": state, "attempt_count": attempts, "last_error_code": code}]
+
+    def test_checker_missing_last_retry_is_infrastructure_failure(self) -> None:
+        for state in ("RETRY_WAIT", "LEASED", "DEAD"):
+            with self.subTest(state=state), self.assertRaises(public_check.EnvironmentFailure):
+                public_check.PublicChecker._require_recovery_window(self.row(state, 4))
+        with self.assertRaises(public_check.EnvironmentFailure):
+            public_check.PublicChecker._require_recovery_window(self.row("LEASED", 3, None))
+
+    def test_invalid_retry_policy_is_still_a_contract_failure(self) -> None:
+        for rows in ([], self.row("DEAD", 1), self.row(attempts=5), self.row(code="http.400.terminal")):
+            with self.subTest(rows=rows), self.assertRaises(public_check.ContractError):
+                public_check.PublicChecker._require_recovery_window(rows)
+
+    def test_remaining_attempt_allows_recovery(self) -> None:
+        public_check.PublicChecker._require_recovery_window(self.row(attempts=3))
+        public_check.PublicChecker._require_recovery_window(self.row("LEASED", 2, None))
+
+    def test_dispatcher_startup_allows_transient_connection_failure(self) -> None:
+        checker = object.__new__(public_check.PublicChecker)
+        with (
+            mock.patch.object(checker, "_service_is_ready", side_effect=[
+                public_check.ContractError("connection refused"), False, True,
+            ]) as ready,
+            mock.patch.object(public_check.time, "sleep"),
+        ):
+            checker._wait_service_ready("outbox-dispatcher")
+        self.assertEqual(ready.call_count, 3)
+
+    def test_outage_does_not_restart_provider_as_dependency_and_unpauses_on_error(self) -> None:
+        checker = object.__new__(public_check.PublicChecker)
+        checker.harness = mock.Mock()
+        checker.harness.psql_rows.return_value = self.row("DEAD", 4)
+        checker.checks = []
+        checker.sensitive = ()
+        with (
+            mock.patch.object(checker, "_service_is_ready", return_value=True),
+            mock.patch.object(checker, "_create_and_submit", return_value=("op", "process")),
+            mock.patch.object(checker, "_external_request", return_value=[{"external_request_id": "external-1"}]),
+            mock.patch.object(checker, "_read_metrics", return_value=({"outbox_pending": [1]}, {}, {})),
+            mock.patch.object(checker, "_poll_rows", return_value=self.row()),
+            self.assertRaises(public_check.EnvironmentFailure),
+        ):
+            checker._check_provider_outage_recovery()
+        calls = checker.harness.compose.call_args_list
+        for call in calls:
+            args = call.args[0]
+            if args[0] == "up":
+                self.assertIn("--no-deps", args)
+        self.assertIn(mock.call(("pause", "outbox-dispatcher"), timeout=30), calls)
+        self.assertEqual(calls[-1], mock.call(("unpause", "outbox-dispatcher"), timeout=30))
+        self.assertTrue(all(check["status"] == "passed" for check in checker.checks))
+
+
 class ActionResultTests(unittest.TestCase):
     def test_repeat_ignores_transport_meta_but_not_business_result(self) -> None:
         first = {
@@ -1001,6 +1091,116 @@ class ResultSchemaTests(unittest.TestCase):
                 schema,
             )
         )
+
+
+class StalledContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.schema = json.loads(
+            (PACKAGE / "contracts/course-1/diagnostics-stalled.result.schema.json").read_text()
+        )
+        self.item = {
+            "operationId": "00000000-0000-4000-8000-000000000001",
+            "processId": "00000000-0000-4000-8000-000000000002",
+            "externalRequestId": "external-example",
+        }
+
+    @staticmethod
+    def response(status, body):
+        return public_check.HttpResult(status, json.dumps(body).encode(), {"Content-Type": "application/json"})
+
+    def checker(self, items):
+        checker = object.__new__(public_check.PublicChecker)
+        checker.harness = mock.Mock()
+        checker.harness.psql_rows.return_value = [{
+            "version": 1, "http_method": "POST", "outcomes": ["FOUND"],
+            "enabled": True, "is_default": True,
+        }]
+        checker.harness.action.side_effect = [
+            self.response(200, {"status": "ok", "outcome": "FOUND", "result": {"items": items}, "meta": {"correlationId": "request-example"}}),
+            self.response(401, {"status": "error", "code": "auth.invalid"}),
+            self.response(403, {"status": "error", "code": "auth.forbidden"}),
+            self.response(422, {"status": "error", "code": "payload.invalid"}),
+        ]
+        checker.harness.http.return_value = self.response(401, {"status": "error", "code": "auth.required"})
+        checker.result_schemas = {"diagnostics-stalled.result.schema.json": self.schema}
+        checker.diagnostics_token = "reader-token"
+        checker.client_token = "client-token"
+        checker.checks = []
+        checker.sensitive = ()
+        checker._restart_snapshot = mock.Mock(side_effect=[
+            {"operations": [{"status": "COMPLETED"}], "action_dispatches": []},
+            {"operations": [{"status": "COMPLETED"}], "action_dispatches": [{"action": "stalled"}]},
+        ])
+        return checker
+
+    def test_payload_is_an_empty_object(self) -> None:
+        schema = json.loads(
+            (PACKAGE / "contracts/course-1/diagnostics-stalled.payload.schema.json").read_text()
+        )
+        self.assertEqual(public_check.validate_json_schema({}, schema), [])
+        for payload in (None, [], {"unexpected": True}):
+            with self.subTest(payload=payload):
+                self.assertTrue(public_check.validate_json_schema(payload, schema))
+
+    def test_empty_and_nonempty_results_pass(self) -> None:
+        for items in ([], [self.item]):
+            with self.subTest(items=items):
+                checker = self.checker(items)
+                checker._check_stalled([self.item["operationId"]])
+                self.assertEqual(len(checker.checks), 8)
+                self.assertTrue(all(check["status"] == "passed" for check in checker.checks))
+                headers = checker.harness.http.call_args.kwargs["headers"]
+                self.assertNotIn("Authorization", headers)
+
+    def test_result_schema_rejects_extra_fields_and_invalid_identifiers(self) -> None:
+        for result in (
+            {}, {"items": [], "extra": 1}, {"items": None},
+            {"items": [{**self.item, "payload": {}}]},
+            {"items": [{**self.item, "operationId": "invalid"}]},
+            {"items": [{**self.item, "processId": None}]},
+            {"items": [{**self.item, "externalRequestId": "line\nbreak"}]},
+        ):
+            with self.subTest(result=result):
+                self.assertTrue(public_check.validate_json_schema(result, self.schema))
+
+    def test_repeated_operation_and_wrong_order_fail(self) -> None:
+        second = {**self.item, "operationId": "00000000-0000-4000-8000-000000000003"}
+        for items in (
+            [self.item, self.item],
+            [self.item, {**self.item, "externalRequestId": "other-request"}],
+            [second, self.item],
+        ):
+            with self.subTest(items=items), self.assertRaises(public_check.ContractError):
+                self.checker(items)._check_stalled([self.item["operationId"]])
+
+    def test_success_for_unauthorized_request_fails(self) -> None:
+        checker = self.checker([])
+        checker.harness.http.return_value = self.response(200, {"status": "ok"})
+        with self.assertRaisesRegex(public_check.ContractError, "stalled-no-token"):
+            checker._check_stalled([self.item["operationId"]])
+
+    def test_success_without_policy_fails(self) -> None:
+        checker = self.checker([])
+        responses = list(checker.harness.action.side_effect)
+        responses[2] = self.response(200, {"status": "ok"})
+        checker.harness.action.side_effect = responses
+        with self.assertRaisesRegex(public_check.ContractError, "stalled-missing-policy"):
+            checker._check_stalled([self.item["operationId"]])
+
+    def test_missing_registration_fails(self) -> None:
+        checker = self.checker([])
+        checker.harness.psql_rows.return_value = []
+        with self.assertRaisesRegex(public_check.ContractError, "stalled-registered-action"):
+            checker._check_stalled([self.item["operationId"]])
+
+    def test_business_mutation_fails(self) -> None:
+        checker = self.checker([])
+        checker._restart_snapshot.side_effect = [
+            {"operations": [{"status": "COMPLETED"}]},
+            {"operations": [{"status": "REJECTED"}]},
+        ]
+        with self.assertRaisesRegex(public_check.ContractError, "stalled-preserves-business-evidence"):
+            checker._check_stalled([self.item["operationId"]])
 
 
 class ProjectionContractTests(unittest.TestCase):
@@ -1056,6 +1256,8 @@ class MachineArtifactTests(unittest.TestCase):
             "receipt-v1.schema.json",
             "diagnostics-trace.payload.schema.json",
             "diagnostics-trace.result.schema.json",
+            "diagnostics-stalled.payload.schema.json",
+            "diagnostics-stalled.result.schema.json",
         ]
         for name in names:
             with self.subTest(name=name):

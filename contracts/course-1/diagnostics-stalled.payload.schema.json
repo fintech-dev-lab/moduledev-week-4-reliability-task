@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moduledev.example/contracts/course-1/diagnostics-stalled.payload.schema.json",
+  "title": "diagnostics.stalled version 1 payload",
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}

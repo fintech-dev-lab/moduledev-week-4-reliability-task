@@ -6,7 +6,7 @@
 
 ## Срок и сдача
 
-Работа выполняется с 11 по 17 сентября 2026 года. Дедлайн — 17 сентября, 23:59 МСК.
+Работа выполняется с 24 по 30 сентября 2026 года. Дедлайн — 30 сентября, 23:59 МСК.
 
 Проверяется продолжение того же репозитория участника и полный SHA commit. До дедлайна участник отправляет куратору URL, ветку и SHA и заранее предоставляет доступ. В сдачу не включаются `.env`, реальные секреты, build output, логи и сгенерированные отчёты проверки.
 
@@ -40,6 +40,8 @@ Failpoint-run останавливает API, worker или dispatcher в сог
 Два Python dispatcher из одного image могут отправить запрос повторно, но стабильный `externalRequestId` и идемпотентность provider не допускают второй внешний платёж.
 
 Поздняя валидная квитанция имеет приоритет над исчерпанием доставки: она атомарно подтверждает результат и продолжает ожидающий процесс. `DEAD` Outbox не должен ложно переводить предметную операцию в `REJECTED` или технически ожидающий процесс в `FAILED`.
+
+Диагностический признак исчерпания — `autocheck.outbox.state = DEAD`, непустые `dead_at` и `last_error_code`, сохранённый `attempt_count`; в trace это `state`, `deadAt`, `lastErrorCode`, `attemptCount`. Process остаётся `WAITING_SIGNAL`, operation — `PROCESSING`. Отдельное поле ошибки у process не требуется.
 
 В test profile используются четыре attempts, включая первую, provider timeout 500 ms, base delays 200/400/800 ms и добавочный jitter от 0 до 100 ms. Lease доставки и lease job равны 2 секундам, poll interval dispatcher и worker не превышает 100 ms. Все значения задаются конфигурацией; обычный профиль может использовать более консервативные интервалы.
 
@@ -107,6 +109,14 @@ Action `diagnostics.trace` по любому известному сквозно
 
 Action version 1 требует policy `diagnostics:read`, имеет outcome `FOUND`, не требует idempotency key и принимает payload `{"identifier":"<value>"}`. Поддерживаются `correlationId`, `requestId`, `operationId`, `processId`, `stepInstanceId`, `jobId`, `executionId`, `attemptId`, `externalRequestId`, `messageId` и `decisionId`. Неизвестный identifier возвращает `404 diagnostics.trace_not_found`. Точная форма payload/result закреплена JSON Schemas `diagnostics-trace.payload.schema.json` и `diagnostics-trace.result.schema.json`.
 
+## Поиск зависших операций
+
+Реализуйте action `diagnostics.stalled`, возвращающий операции с затянувшимся ожиданием квитанции после исчерпания автоматических попыток доставки.
+
+Action version 1 публикуется как `POST /api/diagnostics/stalled`, требует policy `diagnostics:read`, idempotency mode/scope `none` / `none`, включён и является default. Payload — `{}` без дополнительных полей. Ответ: HTTP 200, стандартный envelope с outcome `FOUND` и result `{"items":[...]}`; пустая выборка — `{"items":[]}`. Каждый элемент содержит только UUID `operationId`, UUID `processId` и непустой строковый `externalRequestId`. Операция встречается не более одного раза, сортировка — по `operationId` в канонической UUID-записи, пагинации нет.
+
+Payload не по схеме возвращает `422 payload.invalid`, отсутствующий/невалидный JWT — HTTP 401, недостаточная policy — HTTP 403. Результат вычисляет зарегистрированная PostgreSQL-функция через generic runtime по текущим сохранённым данным. Action не меняет предметное состояние и не запускает доставку; access logs и action audit допустимы. Точная форма закреплена `diagnostics-stalled.payload.schema.json` и `diagnostics-stalled.result.schema.json`.
+
 ## Failpoint-профиль
 
 Закрытый профиль реализует контракт из `07-autocheck-outline.md`: `COURSE_TEST_PROFILE=1`, одна точка в `COURSE_FAILPOINT` и JSON acknowledgement `failpoint.reached` перед блокировкой компонента. Обязательные имена: `after_job_claim`, `after_action_before_finish`, `after_outbox_claim`, `after_provider_response`, `after_inbox_saved`, `after_manual_decision`.
@@ -126,13 +136,19 @@ Action version 1 требует policy `diagnostics:read`, имеет outcome `F
 - обработку unknown outcome внешнего запроса;
 - liveness/readiness API и worker;
 - обязательные метрики;
-- `diagnostics.trace`;
+- `diagnostics.trace` и `diagnostics.stalled`;
 - безопасные structured logs;
 - закрытый failpoint profile;
 - автоматические аварийные tests;
 - одну команду чистого запуска;
 - одну команду полной проверки;
 - итоговый README и troubleshooting guide.
+
+### README и runbook
+
+README содержит требования к окружению, входную конфигурацию, команды первого запуска и полной проверки, признаки readiness и безопасную диагностику типовых отказов.
+
+В runbook приведите команды вызова `diagnostics.trace` и `diagnostics.stalled` и чтения их результатов.
 
 ## Открытая проверка
 
@@ -142,7 +158,7 @@ Action version 1 требует policy `diagnostics:read`, имеет outcome `F
 ./check.sh --repo /path/to/participant-solution
 ```
 
-Checker выполняет cold build, regression сценарии недели 3, запускает два dispatcher/reconciler, проверяет outage/recovery provider, full restart, health, OpenMetrics, `diagnostics.trace` и пишет `week-4-public-report.json` без баллов и секретов. Детерминированные остановки по всем failpoints остаются скрытой проверкой, но их полный контракт опубликован заранее.
+Checker выполняет cold build, regression сценарии недели 3, запускает два dispatcher/reconciler, проверяет outage/recovery provider, full restart, health, OpenMetrics, `diagnostics.trace`, регистрацию, доступ и формат `diagnostics.stalled`, затем пишет `week-4-public-report.json` без баллов и секретов. Детерминированные остановки по всем failpoints остаются скрытой проверкой, но их полный контракт опубликован заранее.
 
 ## Критерии приёмки
 
@@ -159,6 +175,7 @@ Checker выполняет cold build, regression сценарии недели 
 - `ready` и `live` имеют разную корректную семантику.
 - Метрики отражают фактическое состояние очередей.
 - Trace связывает действие, операцию, версию процесса, шаги, попытки и свидетельство результата.
+- `diagnostics.stalled` возвращает выборку операций в опубликованном формате без изменения предметных данных.
 - `payment-processing` не имеет предметного успеха без операции и валидной квитанции.
 - `payment-review` не имеет успеха без аудированного решения.
 - История событий и попыток остаётся append-only.
@@ -184,6 +201,12 @@ Checker выполняет cold build, regression сценарии недели 
 Скрытый контур выбирает собственные точки остановки, число worker/dispatcher, задержки и порядок повторов. Он проверяет инварианты через API и стабильные read-only SQL views, а не имена классов или внутреннюю структуру решения.
 
 ## Оценка недели
+
+Учебный зачёт `learning-outcome.1` требует подтверждённых условий результата недели 3
+и сохранения результата при конкурентных исполнителях, stale completion и аварийных
+границах commit недели 4. Полное техническое соответствие и баллы считаются отдельно.
+Частные отклонения форматов остаются замечаниями; критическое непроверенное свойство
+даёт «Недостаточно данных», доказанное нарушение обязательного условия — «Незачёт».
 
 Помимо канонического вклада недели действует [внутренняя калибровка готовности сдачи](review-calibration-weeks-3-4.md).
 На финальной неделе повышен вес самостоятельного чистого запуска, README/runbook и
@@ -216,7 +239,7 @@ Checker выполняет cold build, regression сценарии недели 
 - итоговый контейнерный стенд;
 - надёжные Python Outbox dispatcher и Inbox reconciler;
 - health endpoints и OpenMetrics;
-- action `diagnostics.trace`;
+- actions `diagnostics.trace` и `diagnostics.stalled`;
 - failpoint profile;
 - полный открытый тестовый набор;
 - машинно читаемый отчёт проверки;

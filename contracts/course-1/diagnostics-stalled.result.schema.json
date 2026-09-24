@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moduledev.example/contracts/course-1/diagnostics-stalled.result.schema.json",
+  "title": "diagnostics.stalled version 1 result",
+  "type": "object",
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": ["operationId", "processId", "externalRequestId"],
+        "properties": {
+          "operationId": {"type": "string", "format": "uuid"},
+          "processId": {"type": "string", "format": "uuid"},
+          "externalRequestId": {"type": "string", "minLength": 1, "maxLength": 200, "not": {"pattern": "[\r\n]"}}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

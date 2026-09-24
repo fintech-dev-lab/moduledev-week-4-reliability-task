@@ -28,7 +28,7 @@ from typing import Any, Callable, Sequence
 
 
 MANIFEST_VERSION = "week-4-public-report/v1"
-TOOL_VERSION = "week-4-public-check/0.2"
+TOOL_VERSION = "week-4-public-check/0.4"
 PUBLISHED_FIXTURE_DIGEST = (
     "f6900512f66ea58afe7fe6b739ac02a433573080a7cc6134e8fed4abfec44813"
 )
@@ -98,7 +98,7 @@ REQUIRED_METRIC_TYPES = {
     "workflow_processes_waiting": "gauge",
     "outbox_pending": "gauge",
     "outbox_oldest_age_seconds": "gauge",
-    "workflow_failures_total": "counter",
+    "workflow_failures": "counter",
 }
 FORBIDDEN_METRIC_LABELS = {
     "correlation_id",
@@ -612,7 +612,7 @@ def parse_openmetrics(
     text: str,
 ) -> tuple[dict[str, list[float]], dict[str, set[str]], dict[str, str]]:
     """Parse enough OpenMetrics syntax to validate published scalar series."""
-    if not text.endswith("# EOF\n"):
+    if "\r" in text or not re.search(r"(?:^|\n)# EOF\n?\Z", text):
         raise ValueError("OpenMetrics document must end with # EOF")
     samples: dict[str, list[float]] = {}
     labels: dict[str, set[str]] = {}
@@ -662,6 +662,14 @@ def validate_json_schema(value: Any, schema: dict[str, Any]) -> list[str]:
         if "$ref" in rule:
             visit(item, resolve(str(rule["$ref"])), path)
             return
+        negated = rule.get("not")
+        if isinstance(negated, dict):
+            before = len(errors)
+            visit(item, negated, path)
+            matched = len(errors) == before
+            del errors[before:]
+            if matched:
+                errors.append(f"{path}: matches a forbidden schema")
         alternatives = rule.get("oneOf")
         if isinstance(alternatives, list):
             matches = 0
@@ -1978,6 +1986,7 @@ class PublicChecker:
             for name in (
                 "payment-submit.result.schema.json",
                 "diagnostics-trace.result.schema.json",
+                "diagnostics-stalled.result.schema.json",
             )
         }
         self.restart_callback: tuple[str, dict[str, Any], int, dict[str, Any]] | None = (
@@ -2377,6 +2386,17 @@ class PublicChecker:
         except (UnicodeDecodeError, ValueError) as error:
             raise ContractError(f"{service} metrics are invalid OpenMetrics") from error
 
+    def _wait_service_ready(self, service: str, timeout: float = 30) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if self._service_is_ready(service):
+                    return
+            except ContractError:
+                pass
+            time.sleep(0.1)
+        raise ContractError(f"{service} readiness did not become 200")
+
     def _check_observability_endpoints(self) -> None:
         for service in OBSERVABILITY_ENDPOINTS:
             live = self._service_http(service, "/health/live")
@@ -2437,48 +2457,28 @@ class PublicChecker:
         self.h.require_docker_result(
             stopped_provider, "cannot stop provider for outage scenario"
         )
-        operation_id, process_id = self._create_and_submit(
-            "providerRequest", "provider-outage"
-        )
-        external_rows = self._external_request(operation_id)
-        external_id = self._text_id(
-            external_rows[0].get("external_request_id"), "externalRequestId"
-        )
         started = self.h.compose(
-            ("up", "-d", "--no-build", "outbox-dispatcher"), timeout=30
+            ("up", "-d", "--no-build", "--no-deps", "outbox-dispatcher"), timeout=30
         )
         self.h.require_docker_result(started, "cannot start dispatcher during outage")
-        external_sql = self._sql_text(external_id)
-        retry_rows = self._poll_rows(
-            "SELECT state, attempt_count, next_attempt_at, last_error_code "
-            "FROM autocheck.outbox "
-            f"WHERE external_request_id = {external_sql}",
-            lambda rows: len(rows) == 1
-            and rows[0].get("state") == "RETRY_WAIT"
-            and int(rows[0].get("attempt_count", 0)) >= 1
-            and rows[0].get("next_attempt_at") is not None
-            and str(rows[0].get("last_error_code", "")).endswith(".retryable"),
-            timeout=15,
-        )
-        self._record(
-            "provider-outage-persists-retry",
-            "reliability",
-            True,
-            len(retry_rows) == 1 and retry_rows[0].get("state") == "RETRY_WAIT",
-        )
+        self._wait_service_ready("outbox-dispatcher")
         self._record(
             "provider-outage-keeps-runtime-ready",
             "observability",
             True,
             all(
                 self._service_is_ready(service)
-                for service in (
-                    "api",
-                    "worker-a",
-                    "worker-b",
-                    "outbox-dispatcher",
-                )
+                for service in ("api", "worker-a", "worker-b", "outbox-dispatcher")
             ),
+        )
+        stopped = self.h.compose(("stop", "outbox-dispatcher"), timeout=30)
+        self.h.require_docker_result(stopped, "cannot prepare pending outage request")
+        operation_id, process_id = self._create_and_submit(
+            "providerRequest", "provider-outage"
+        )
+        external_rows = self._external_request(operation_id)
+        external_id = self._text_id(
+            external_rows[0].get("external_request_id"), "externalRequestId"
         )
         samples, _, _ = self._read_metrics("api")
         self._record(
@@ -2487,20 +2487,59 @@ class PublicChecker:
             True,
             any(value >= 1 for value in samples.get("outbox_pending", [])),
         )
-        stop_retrying = self.h.compose(("stop", "outbox-dispatcher"), timeout=30)
-        self.h.require_docker_result(
-            stop_retrying, "cannot pause dispatcher before provider recovery"
+        started = self.h.compose(
+            ("up", "-d", "--no-build", "--no-deps", "outbox-dispatcher"), timeout=30
         )
-        start_provider = self.h.compose(
-            ("up", "-d", "--no-build", "provider-simulator"), timeout=30
+        self.h.require_docker_result(started, "cannot start delivery during outage")
+        external_sql = self._sql_text(external_id)
+        retry_query = (
+            "SELECT state, attempt_count, next_attempt_at, last_error_code "
+            "FROM autocheck.outbox "
+            f"WHERE external_request_id = {external_sql}"
         )
-        self.h.require_docker_result(start_provider, "cannot restore provider")
+        retry_rows = self._poll_rows(
+            retry_query,
+            lambda rows: len(rows) == 1
+            and rows[0].get("state") in {"RETRY_WAIT", "DEAD"},
+            timeout=15,
+        )
+        paused = self.h.compose(("pause", "outbox-dispatcher"), timeout=30)
+        self.h.require_docker_result(paused, "cannot pause retrying dispatcher")
+        try:
+            self._require_recovery_window(self.h.psql_rows(retry_query))
+            self._record(
+                "provider-outage-persists-retry",
+                "reliability",
+                True,
+                len(retry_rows) == 1
+                and retry_rows[0].get("state") == "RETRY_WAIT"
+                and int(retry_rows[0].get("attempt_count", 0)) >= 1
+                and retry_rows[0].get("next_attempt_at") is not None
+                and str(retry_rows[0].get("last_error_code", "")).endswith(".retryable"),
+            )
+            start_provider = self.h.compose(
+                ("up", "-d", "--no-build", "--no-deps", "provider-simulator"), timeout=30
+            )
+            self.h.require_docker_result(start_provider, "cannot restore provider")
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    if self._provider_audit(external_id).status in {200, 404}:
+                        break
+                except ContractError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise EnvironmentFailure("provider did not become available before recovery")
+                time.sleep(0.1)
+        finally:
+            resumed = self.h.compose(("unpause", "outbox-dispatcher"), timeout=30)
+            self.h.require_docker_result(resumed, "cannot unpause dispatcher")
         resume = self.h.compose(
             (
                 "up",
                 "-d",
                 "--no-build",
-                "outbox-dispatcher",
+                "--no-deps",
                 "outbox-dispatcher-b",
             ),
             timeout=30,
@@ -2520,6 +2559,28 @@ class PublicChecker:
             and audit_json.get("paymentCount") == 1,
         )
         return operation_id, process_id
+
+    @staticmethod
+    def _require_recovery_window(rows: list[dict[str, Any]]) -> None:
+        if len(rows) != 1:
+            raise ContractError("outage delivery is missing")
+        row = rows[0]
+        attempts = row.get("attempt_count")
+        state = row.get("state")
+        if not isinstance(attempts, int) or not 1 <= attempts <= 4:
+            raise ContractError("outage delivery has invalid attempt count")
+        if state == "DEAD" and attempts < 4:
+            raise ContractError("retryable outage exhausted before the attempt limit")
+        if state not in {"RETRY_WAIT", "LEASED", "DEAD"}:
+            raise ContractError("outage delivery has unexpected state")
+        if state != "LEASED" and not str(row.get("last_error_code", "")).endswith(".retryable"):
+            raise ContractError("provider outage is not classified as retryable")
+        # A LEASED row may count only completed attempts; allow one in-flight failure.
+        if attempts == 4 or (state == "LEASED" and attempts >= 3):
+            raise EnvironmentFailure(
+                "checker missed the recovery window before the last Outbox attempt; "
+                "rerun on a responsive Docker host"
+            )
 
     def _check_admission_and_start(self) -> None:
         self.fixture = load_fixture(self.fixtures)
@@ -3630,6 +3691,82 @@ class PublicChecker:
             and missing_json.get("code") == "diagnostics.trace_not_found",
         )
 
+    def _check_stalled(self, operation_ids: Sequence[str]) -> None:
+        registrations = self.h.psql_rows(
+            "SELECT version, http_method, outcomes, enabled, is_default "
+            "FROM autocheck.action_definitions "
+            "WHERE module = 'diagnostics' AND action = 'stalled' AND version = 1"
+        )
+        self._record(
+            "stalled-registered-action", "observability", True,
+            registrations == [{
+                "version": 1, "http_method": "POST", "outcomes": ["FOUND"],
+                "enabled": True, "is_default": True,
+            }],
+        )
+        before = self._restart_snapshot(operation_ids)
+        before.pop("action_dispatches", None)
+        response = self.h.action("diagnostics", "stalled", {}, self.diagnostics_token)
+        envelope = response.json()
+        result = envelope.get("result") if isinstance(envelope, dict) else None
+        schema_errors = validate_json_schema(
+            result, self.result_schemas["diagnostics-stalled.result.schema.json"]
+        )
+        meta = envelope.get("meta") if isinstance(envelope, dict) else None
+        self._record(
+            "stalled-response-contract", "observability", True,
+            response.status == 200
+            and self._content_type(response).startswith("application/json")
+            and isinstance(envelope, dict)
+            and envelope.get("status") == "ok"
+            and envelope.get("outcome") == "FOUND"
+            and isinstance(meta, dict)
+            and isinstance(meta.get("correlationId"), str)
+            and bool(meta.get("correlationId"))
+            and not schema_errors,
+        )
+        identifiers = [self._uuid(item["operationId"], "operationId") for item in result["items"]]
+        self._record(
+            "stalled-ordered-unique-operations", "observability", True,
+            identifiers == sorted(set(identifiers)),
+        )
+        for label, token, expected_status in (
+            ("no-token", "", 401),
+            ("invalid-token", "not-a-jwt", 401),
+            ("missing-policy", self.client_token, 403),
+        ):
+            if label == "no-token":
+                denied = self.h.http(
+                    "POST", "/api/diagnostics/stalled", body=receipt_bytes({}),
+                    headers={"Content-Type": "application/json", "X-Action-Version": "1"},
+                )
+            else:
+                denied = self.h.action("diagnostics", "stalled", {}, token)
+            denied_json = denied.json()
+            self._record(
+                f"stalled-{label}", "security", True,
+                denied.status == expected_status
+                and isinstance(denied_json, dict)
+                and denied_json.get("status") == "error",
+            )
+        invalid = self.h.action(
+            "diagnostics", "stalled", {"unexpected": True}, self.diagnostics_token
+        )
+        invalid_json = invalid.json()
+        self._record(
+            "stalled-invalid-payload", "observability", True,
+            invalid.status == 422
+            and isinstance(invalid_json, dict)
+            and invalid_json.get("status") == "error"
+            and invalid_json.get("code") == "payload.invalid",
+        )
+        after = self._restart_snapshot(operation_ids)
+        after.pop("action_dispatches", None)
+        self._record(
+            "stalled-preserves-business-evidence", "observability", True,
+            after == before,
+        )
+
     def _check_postgres_readiness(self) -> None:
         stopped = self.h.compose(("stop", "postgres"), timeout=30)
         self.h.require_docker_result(stopped, "cannot stop PostgreSQL for readiness")
@@ -4014,6 +4151,9 @@ class PublicChecker:
         )
         self._check_postgres_readiness()
         self._check_full_restart(
+            (outage_operation, provider_operation, adapter_operation, manual_operation)
+        )
+        self._check_stalled(
             (outage_operation, provider_operation, adapter_operation, manual_operation)
         )
         self._check_final_log_hygiene()

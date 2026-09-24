@@ -414,9 +414,10 @@ Nullability следует опубликованной модели состо�
 7. Остановить и перезапустить затронутый контейнер.
 8. Повторить callback и manual decision после полного рестарта.
 9. Сверить health, metrics, trace и read-only проекции.
-10. Проверить логи и images на секреты.
+10. Проверить регистрацию, доступ, формат и отсутствие предметных изменений у `diagnostics.stalled`.
+11. Проверить логи и images на секреты.
 
-Публичный checker выполняет regression недели 3, provider outage/recovery до исчерпания попыток, конкурентный запуск двух dispatcher/reconciler, полный restart, health/OpenMetrics и trace. Проверка всех commit-boundary failpoints, окончательного `DEAD` с поздней квитанцией и случайных interleavings остаётся скрытой.
+Публичный checker выполняет regression недели 3, provider outage/recovery до исчерпания попыток, конкурентный запуск двух dispatcher/reconciler, полный restart, health/OpenMetrics, trace и контрактные вызовы `diagnostics.stalled`. Для `diagnostics.stalled` проверяются manifest version 1, payload/result schema, policy, отсутствие повторяющихся операций и порядок ответа; сохранённые цепочки завершённых тестовых операций сравниваются до/после вызовов без учёта обычного action audit. Проверка всех commit-boundary failpoints, окончательного `DEAD` с поздней квитанцией и случайных interleavings остаётся скрытой.
 
 ## Открытые сценарии
 
@@ -476,12 +477,18 @@ Failpoints включаются только в закрытом test profile и
 
 | `COURSE_FAILPOINT` | Компонент | Граница |
 |---|---|---|
-| `after_job_claim` | worker | после commit аренды до action |
-| `after_action_before_finish` | worker | после action effect и contract validation внутри transaction до `finish_job` и commit |
-| `after_outbox_claim` | Python dispatcher | после commit claim до provider HTTP |
-| `after_provider_response` | Python dispatcher | после provider response до conditional delivery completion |
-| `after_inbox_saved` | API/Python reconciler | после Inbox commit до workflow signal |
-| `after_manual_decision` | API/worker | после фиксации решения до следующего job |
+| `after_job_claim` | `worker-a` | после commit аренды до action |
+| `after_action_before_finish` | `worker-a` | после action effect и contract validation внутри transaction до `finish_job` и commit |
+| `after_outbox_claim` | `outbox-dispatcher` | после commit claim до provider HTTP |
+| `after_provider_response` | `outbox-dispatcher` | после provider response до conditional delivery completion |
+| `after_inbox_saved` | `api` | после commit Inbox, receipt и idempotency result, до HTTP-ответа; оба reconciler остановлены до callback |
+| `after_manual_decision` | `api` | после выполнения `workflow.manual` и валидации результата, до commit общей transaction решения, перехода и следующего job |
+
+Имена services в таблице задают целевой экземпляр базового сценария. До создания работы проверка останавливает конкурирующий `worker-b` или `outbox-dispatcher-b`, чтобы работу получил целевой исполнитель. После acknowledgement и принудительного завершения целевого контейнера второй экземпляр можно запустить для проверки reclaim/fencing. Failpoint включается только у одного экземпляра.
+
+Для `after_inbox_saved` проверка заранее останавливает `inbox-reconciler` и `inbox-reconciler-b`, вызывает callback и ждёт acknowledgement API. После остановки API сохранённый Inbox доступен через read-only проекции; затем API и оба reconciler запускаются без failpoint. Это исключает применение signal до проверяемой границы. API не выполняет работу reconciler.
+
+Для `after_manual_decision` остановка API откатывает решение, переход, новый job и успешный idempotency result вместе; повтор команды с теми же `Idempotency-Key` и payload создаёт ровно одно решение. Незавершённая команда восстанавливается автоматически, без ручного удаления ключа. «После выполнения» здесь не означает «после commit». SQL effect и валидация результата остаются в одной transaction generic action runtime.
 
 При достижении точки компонент пишет одну JSON-запись `{"event":"failpoint.reached","name":"after_job_claim","instanceId":"..."}` и блокируется до принудительной остановки. Проверка ждёт эту запись, останавливает компонент, удаляет failpoint из override, запускает компонент и проверяет инварианты. Потеря ответа после фактического принятия provider включается документированным режимом `lost-response` самого simulator. Случайные `sleep` вместо acknowledgement barrier не используются.
 
@@ -519,7 +526,12 @@ Failpoints включаются только в закрытом test profile и
 Artifact дополнительно хранит policy version/hash, исходные уровни A/B/C/D, raw score,
 readiness cap, окончательную оценку, feedback history с доказательствами доставки и
 ссылку на прежнюю оценку при пересчёте. Старый runtime не выдаётся за новый запуск.
-Канонический scorecard курса и диагностический /100 не суммируются.
+Канонический scorecard курса и диагностический /100 не суммируются. С политики
+`late-week-quality.3` поле `canonicalVerdict` отражает полное техническое соответствие,
+а `verdict` — учебный зачёт `learning-outcome.1`. `acceptance.gates` содержит обязательные
+условия результата; `acceptance.observations` классифицирует все недостатки и замечания
+по условию возникновения и последствию. Неблокирующее отклонение снижает балл;
+непроверенное критическое свойство даёт UNDETERMINED, доказанный блокер — FAILED.
 
 ```json
 {

@@ -6,7 +6,7 @@
 
 1. [Условие задания](../task/assignment.md) задаёт обязательный результат.
 2. [Полный контракт недели 4](05-week-4.md) задаёт архитектурные и recovery-инварианты.
-3. [Контракт наблюдаемости](observability-contracts.md) задаёт точные health, metrics и trace seams.
+3. [Контракт наблюдаемости](observability-contracts.md) задаёт health, metrics, `diagnostics.trace` и `diagnostics.stalled`.
 4. [Внешние HTTP-контракты](external-contracts.md) сохраняют точные provider/receipt contracts недели 3.
 5. [Конфигурация и запуск](configuration.md) задаёт Compose seam, переменные и test profile.
 6. [Контур автопроверки](07-autocheck-outline.md) задаёт проверяемые сценарии.
