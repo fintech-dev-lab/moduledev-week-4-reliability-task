@@ -372,6 +372,7 @@ TIMESTAMPTZ_COLUMNS = {
     "applied_at",
     "completed_at",
     "created_at",
+    "dead_at",
     "delivered_at",
     "entered_at",
     "finished_at",

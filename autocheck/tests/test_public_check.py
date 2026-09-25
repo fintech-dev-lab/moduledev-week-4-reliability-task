@@ -1210,6 +1210,10 @@ class ProjectionContractTests(unittest.TestCase):
             public_check._expected_column_type("received_at"),
             "timestamp with time zone",
         )
+        self.assertEqual(
+            public_check._expected_column_type("dead_at"),
+            "timestamp with time zone",
+        )
         self.assertEqual(public_check._expected_column_type("lease_version"), "bigint")
         self.assertEqual(public_check._expected_column_type("outcomes"), "jsonb")
         self.assertEqual(public_check._expected_column_type("message_id"), "text")
